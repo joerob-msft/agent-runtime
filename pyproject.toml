@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-runtime"
+dynamic = ["version"]
+description = "A lightweight agent runtime that turns any machine into an AI-agent-ready compute target"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "Apache-2.0"}
+authors = [{name = "Joe Robinson"}]
+keywords = ["ai", "agent", "runtime", "acp", "copilot", "remote-execution"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: Software Development :: Build Tools",
+]
+
+# Zero dependencies — stdlib only for base install
+dependencies = []
+
+[project.optional-dependencies]
+terminal = ["pywinpty>=2.0", "websockets>=14.0"]
+
+[project.scripts]
+agent-server = "agent_runtime.cli:main"
+
+[project.urls]
+Repository = "https://github.com/joerob-msft/agent-runtime"
+Documentation = "https://github.com/joerob-msft/agent-runtime#readme"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["agent_runtime*"]
+
+[tool.setuptools.dynamic]
+version = {attr = "agent_runtime.__version__"}
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
