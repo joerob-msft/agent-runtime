@@ -120,6 +120,9 @@ def _run_server(port: int, register_url: str, name: str,
             if terminal_url:
                 os.environ["DEVPILOT_TERMINAL_URL"] = terminal_url
                 print(f"[tunnel] Terminal URL: {terminal_url}")
+        else:
+            print("[tunnel] WARNING: Tunnel not available — server only reachable locally.")
+            print("[tunnel] Dashboard registration will use localhost URL.")
 
     if register_url:
         _register(register_url, name, port)
@@ -249,6 +252,24 @@ def _generate_tunnel_token(devtunnel: str, tunnel_id: str) -> str:
     return ""
 
 
+def _check_tunnel_login(devtunnel: str) -> bool:
+    """Check if devtunnel CLI is logged in. Returns True if logged in."""
+    try:
+        result = subprocess.run(
+            [devtunnel, "user", "show"],
+            capture_output=True, text=True, timeout=10,
+        )
+        # "Not logged in" or non-zero exit means expired/missing login
+        if result.returncode != 0:
+            return False
+        output = result.stdout + result.stderr
+        if "not logged in" in output.lower():
+            return False
+        return True
+    except Exception:
+        return False
+
+
 def _start_tunnel(port: int, tunnel_id: str = "") -> tuple[subprocess.Popen, str]:
     """Start a devtunnel and parse the tunnel URL from its output.
 
@@ -265,6 +286,14 @@ def _start_tunnel(port: int, tunnel_id: str = "") -> tuple[subprocess.Popen, str
     devtunnel = shutil.which("devtunnel")
     if not devtunnel:
         print("[tunnel] ERROR: 'devtunnel' not found. Install from https://aka.ms/devtunnels/install")
+        print("[tunnel] Continuing without tunnel — server will only be reachable locally.")
+        return None, ""
+
+    # Pre-flight: check devtunnel login status
+    if not _check_tunnel_login(devtunnel):
+        print("[tunnel] ERROR: devtunnel login expired or missing.")
+        print("[tunnel] Run: devtunnel user login")
+        print("[tunnel] Then restart the agent.")
         print("[tunnel] Continuing without tunnel — server will only be reachable locally.")
         return None, ""
 
@@ -338,6 +367,11 @@ def _start_tunnel(port: int, tunnel_id: str = "") -> tuple[subprocess.Popen, str
         if not line:
             break
         print(f"[tunnel] {line.rstrip()}")
+        # Detect login failure from host output
+        if "login required" in line.lower() or "not logged in" in line.lower():
+            print("[tunnel] ERROR: devtunnel login expired. Run: devtunnel user login")
+            proc.terminate()
+            return None, ""
         # Look for "Connect via browser: https://xxx.devtunnels.ms"
         match = re.search(r"(https://\S+\.devtunnels\.ms\S*)", line)
         if match:
@@ -348,7 +382,12 @@ def _start_tunnel(port: int, tunnel_id: str = "") -> tuple[subprocess.Popen, str
                 break
 
     if not tunnel_url:
-        print("[tunnel] WARNING: Could not parse tunnel URL. Registration may fail.")
+        print("[tunnel] ERROR: Could not parse tunnel URL — tunnel may not be working.")
+        print("[tunnel] Check: devtunnel user show  (login status)")
+        print("[tunnel] Check: devtunnel list        (tunnel exists)")
+        if proc.poll() is None:
+            proc.terminate()
+        return None, ""
 
     # Continue reading tunnel output in a background thread so it doesn't block
     import threading

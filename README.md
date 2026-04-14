@@ -153,3 +153,37 @@ print(result.stop_reason)       # "end_turn", "timeout", "error"
 ## License
 
 Apache 2.0 — see [LICENSE](LICENSE) for details.
+
+## Releasing
+
+Releases are automated via GitHub Actions. When a version tag is pushed,
+CI runs tests → builds the wheel → publishes to PyPI using Trusted Publisher (OIDC).
+
+```bash
+# 1. Create a release branch
+git checkout -b release/v0.2.0
+
+# 2. Bump version in agent_runtime/__init__.py
+#    __version__ = "0.2.0"
+
+# 3. Commit and push
+git add agent_runtime/__init__.py
+git commit -m "Bump version to 0.2.0"
+git push origin release/v0.2.0
+
+# 4. Merge to main (via PR or direct push)
+git checkout main
+git merge release/v0.2.0
+git push origin main
+
+# 5. Tag and push — this triggers the PyPI publish
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+The publish workflow: runs tests (Windows, Python 3.11-3.13) → builds sdist + wheel → publishes to PyPI.
+
+**First-time setup** (one-time on pypi.org):
+1. Go to `pypi.org/manage/project/devpilot-agent/settings/publishing/`
+2. Add trusted publisher: owner=`joerob-msft`, repo=`agent-runtime`, workflow=`publish.yml`, environment=`pypi`
+3. Create a `pypi` environment in GitHub repo settings (Settings → Environments → New)
