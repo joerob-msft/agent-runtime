@@ -17,10 +17,10 @@ A lightweight agent runtime that turns any machine into an AI-agent-ready comput
 
 ```bash
 # Core (zero dependencies)
-pip install agent-runtime
+pip install devpilot-agent
 
 # With interactive terminal support (Windows)
-pip install agent-runtime[terminal]
+pip install devpilot-agent[terminal]
 ```
 
 ## Quick Start

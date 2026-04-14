@@ -3,7 +3,7 @@ requires = ["setuptools>=68.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "agent-runtime"
+name = "devpilot-agent"
 dynamic = ["version"]
 description = "A lightweight agent runtime that turns any machine into an AI-agent-ready compute target"
 readme = "README.md"
