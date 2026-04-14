@@ -8,13 +8,13 @@ dynamic = ["version"]
 description = "A lightweight agent runtime that turns any machine into an AI-agent-ready compute target"
 readme = "README.md"
 requires-python = ">=3.11"
-license = {text = "Apache-2.0"}
+license = "Apache-2.0"
 authors = [{name = "Joe Robinson"}]
 keywords = ["ai", "agent", "runtime", "acp", "copilot", "remote-execution"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: Apache Software License",
+
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
