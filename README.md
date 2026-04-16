@@ -198,7 +198,7 @@ curl http://localhost:8585/health -H "X-API-Key: $KEY"
 ```json
 {
   "status": "ok",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "hostname": "devbox-01",
   "jobs": 0,
   "cwd": "C:\\\\src\\\\agent-runtime",
@@ -301,11 +301,11 @@ Releases are automated via GitHub Actions. The checked-in publish workflow runs 
 4. Fast-forward and push the `release` branch
 5. Push `vX.Y.Z` to trigger PyPI publish
 
-Example for `0.2.1`:
+Example for `0.2.2`:
 
 ```bash
 # 1. Bump version in agent_runtime/__init__.py
-#    __version__ = "0.2.1"
+#    __version__ = "0.2.2"
 
 # 2. Validate the release locally
 python -m pytest tests/ -q
@@ -314,7 +314,7 @@ python -m build
 # 3. Commit and push main
 git checkout main
 git add agent_runtime/__init__.py README.md agent_runtime/ tests/
-git commit -m "Release 0.2.1"
+git commit -m "Release 0.2.2"
 git push origin main
 
 # 4. Fast-forward the shared release branch
@@ -324,8 +324,8 @@ git push origin release
 
 # 5. Push the version tag — this triggers .github/workflows/publish.yml
 git checkout main
-git tag v0.2.1
-git push origin refs/tags/v0.2.1
+git tag v0.2.2
+git push origin refs/tags/v0.2.2
 ```
 
 The publish workflow runs:
@@ -334,7 +334,14 @@ The publish workflow runs:
 2. Source distribution + wheel build
 3. PyPI publish via Trusted Publisher
 
-`twine upload` is not the normal release path for this repo.
+If Trusted Publisher is unavailable, the fallback is:
+
+```bash
+python -m build
+python -m twine upload dist/devpilot_agent-0.2.2*
+```
+
+Use a PyPI API token for `twine upload`. The preferred path is still the tag-triggered GitHub Actions publish.
 
 **First-time setup** (one-time on pypi.org):
 1. Go to `pypi.org/manage/project/devpilot-agent/settings/publishing/`
