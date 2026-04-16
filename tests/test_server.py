@@ -2,6 +2,7 @@
 
 import json
 import os
+import sys
 import threading
 import time
 from http.server import HTTPServer
@@ -13,7 +14,9 @@ from agent_runtime.server import (
     _VERSION,
     _jobs,
     _jobs_lock,
+    _run_acp_command,
 )
+from agent_runtime.acp_client import ACPResult
 import agent_runtime.server as _server_module
 
 
@@ -388,6 +391,88 @@ class TestExecAndPoll:
         finally:
             self._clear_jobs()
             server.shutdown()
+
+    def test_exec_env_visible_to_shell_process(self):
+        server, port, _ = _start_test_server()
+        try:
+            api_key = _server_module._api_key
+            self._clear_jobs()
+
+            command = (
+                f'"{sys.executable}" -c '
+                "\"import os; print(os.environ.get('DEVPILOT_TEST_ENV', ''))\""
+            )
+            status, data = _post(
+                port,
+                "/exec",
+                {
+                    "command": command,
+                    "timeout": 10,
+                    "env": {"DEVPILOT_TEST_ENV": "env-visible"},
+                },
+                api_key=api_key,
+            )
+            assert status == 202
+            job_id = data["jobId"]
+
+            for _ in range(20):
+                time.sleep(0.5)
+                result = _get(port, f"/jobs/{job_id}", api_key=api_key)
+                if result["status"] in ("completed", "failed", "timeout"):
+                    break
+
+            assert result["status"] == "completed"
+            assert "env-visible" in result["stdout"]
+        finally:
+            self._clear_jobs()
+            server.shutdown()
+
+    def test_exec_rejects_invalid_env_payload(self):
+        server, port, _ = _start_test_server()
+        try:
+            api_key = _server_module._api_key
+            status, data = _post(
+                port,
+                "/exec",
+                {"command": "echo hello", "env": {"BAD": 123}},
+                api_key=api_key,
+            )
+            assert status == 400
+            assert data["error"] == "env must be an object of string key/value pairs"
+        finally:
+            server.shutdown()
+
+    def test_run_acp_command_passes_env_to_client(self):
+        self._clear_jobs()
+        with _jobs_lock:
+            _jobs["acp-job"] = {"jobId": "acp-job", "status": "pending"}
+
+        with patch("agent_runtime.acp_client.run_acp_session_sync") as mock_run:
+            mock_run.return_value = ACPResult(
+                session_id="session-123",
+                stop_reason="no_prompt",
+                output_text="",
+                stderr="",
+                events=[],
+            )
+
+            _run_acp_command(
+                "acp-job",
+                "agent-server --stdio",
+                "",
+                os.getcwd(),
+                10,
+                None,
+                None,
+                None,
+                {"DEVPILOT_TEST_ENV": "acp-visible"},
+            )
+
+        assert mock_run.call_count == 1
+        assert mock_run.call_args.kwargs["env"] == {"DEVPILOT_TEST_ENV": "acp-visible"}
+        with _jobs_lock:
+            assert _jobs["acp-job"]["status"] == "completed"
+        self._clear_jobs()
 
 
 class TestNudgeEndpoint:

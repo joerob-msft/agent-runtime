@@ -96,6 +96,28 @@ def _persist_api_key(key: str) -> None:
         print(f"[auth] WARNING: Could not persist API key: {e}")
 
 
+def _normalize_env(raw_env: object) -> dict[str, str] | None:
+    """Validate and normalize an optional env payload."""
+    if raw_env is None:
+        return None
+    if not isinstance(raw_env, dict):
+        raise ValueError("env must be an object of string key/value pairs")
+    env: dict[str, str] = {}
+    for key, value in raw_env.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            raise ValueError("env must be an object of string key/value pairs")
+        env[key] = value
+    return env
+
+
+def _merged_env(env: dict[str, str] | None) -> dict[str, str]:
+    """Return the process environment with an optional overlay."""
+    merged = os.environ.copy()
+    if env:
+        merged.update(env)
+    return merged
+
+
 def _reader_thread(stream, chunks: list, job_id: str) -> None:
     """Read lines from a stream, updating the job's activity timestamp."""
     try:
@@ -113,7 +135,13 @@ def _reader_thread(stream, chunks: list, job_id: str) -> None:
             pass
 
 
-def _run_command(job_id: str, command: str, workdir: str, timeout: int) -> None:
+def _run_command(
+    job_id: str,
+    command: str,
+    workdir: str,
+    timeout: int,
+    env: dict[str, str] | None = None,
+) -> None:
     """Execute a command in a background thread and store the result.
 
     Uses Popen with reader threads so we can track output activity
@@ -136,6 +164,7 @@ def _run_command(job_id: str, command: str, workdir: str, timeout: int) -> None:
             text=True,
             encoding="utf-8",
             errors="replace",
+            env=_merged_env(env),
         )
 
         with _jobs_lock:
@@ -229,7 +258,8 @@ def _acp_available() -> bool:
 
 def _run_acp_command(job_id: str, agent: str, prompt: str, workdir: str,
                      timeout: int, session_id: str | None,
-                     model: str | None, effort: str | None) -> None:
+                     model: str | None, effort: str | None,
+                     env: dict[str, str] | None = None) -> None:
     """Run an ACP session in a dedicated thread with its own event loop."""
     import shlex
     from agent_runtime.acp_client import (
@@ -258,6 +288,7 @@ def _run_acp_command(job_id: str, agent: str, prompt: str, workdir: str,
             session_id=session_id,
             model=model,
             effort=effort,
+            env=env,
             permission_policy=policy,
             on_event=on_event,
         )
@@ -388,6 +419,11 @@ class CommandHandler(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(length)) if length > 0 else {}
 
         mode = body.get("mode", "shell")
+        try:
+            env = _normalize_env(body.get("env"))
+        except ValueError as e:
+            self._json_response(400, {"error": str(e)})
+            return
 
         # ── ACP mode ────────────────────────────────────────────────────
         if mode == "acp":
@@ -415,7 +451,7 @@ class CommandHandler(BaseHTTPRequestHandler):
             thread = threading.Thread(
                 target=_run_acp_command,
                 args=(job_id, agent, prompt, workdir, timeout,
-                      acp_session_id, acp_model, acp_effort),
+                      acp_session_id, acp_model, acp_effort, env),
                 daemon=True,
             )
             thread.start()
@@ -443,7 +479,7 @@ class CommandHandler(BaseHTTPRequestHandler):
 
         thread = threading.Thread(
             target=_run_command,
-            args=(job_id, command, workdir, timeout),
+            args=(job_id, command, workdir, timeout, env),
             daemon=True,
         )
         thread.start()

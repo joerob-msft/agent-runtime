@@ -237,6 +237,7 @@ async def run_acp_session(
     model: Optional[str] = None,
     effort: Optional[str] = None,
     mode: Optional[str] = None,
+    env: Optional[dict[str, str]] = None,
     permission_policy: Optional[PermissionPolicy] = None,
     on_event: Optional[Callable[[ACPEvent], None]] = None,
 ) -> ACPResult:
@@ -268,6 +269,11 @@ async def run_acp_session(
     terminal_counter_ref = [0]  # Shared mutable counter across all message loop phases
 
     workdir_resolved = Path(workdir).resolve()
+    merged_env = os.environ.copy()
+    if env:
+        for key, value in env.items():
+            if isinstance(key, str) and isinstance(value, str):
+                merged_env[key] = value
 
     def _path_ok(path: str) -> bool:
         """Validate path is under workdir (resolve symlinks/junctions).
@@ -294,6 +300,7 @@ async def run_acp_session(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         cwd=workdir,
+        env=merged_env,
     )
 
     try:
@@ -338,6 +345,7 @@ async def run_acp_session(
             policy=policy, workdir=workdir, workdir_resolved=workdir_resolved,
             path_ok=_path_ok, terminals=terminals,
             terminal_outputs=terminal_outputs,
+            merged_env=merged_env,
             terminal_counter_ref=terminal_counter_ref,
             add_event=lambda e: None, timeout=30,
         )
@@ -360,6 +368,7 @@ async def run_acp_session(
                 workdir_resolved=workdir_resolved,
                 path_ok=_path_ok, terminals=terminals,
                 terminal_outputs=terminal_outputs,
+                merged_env=merged_env,
                 terminal_counter_ref=terminal_counter_ref,
                 add_event=lambda e: None,  # Don't track replay events
                 timeout=60,
@@ -379,6 +388,7 @@ async def run_acp_session(
                 workdir_resolved=workdir_resolved,
                 path_ok=_path_ok, terminals=terminals,
                 terminal_outputs=terminal_outputs,
+                merged_env=merged_env,
                 terminal_counter_ref=terminal_counter_ref,
                 add_event=lambda e: None, timeout=30,
             )
@@ -409,6 +419,7 @@ async def run_acp_session(
                         workdir_resolved=workdir_resolved,
                         path_ok=_path_ok, terminals=terminals,
                         terminal_outputs=terminal_outputs,
+                        merged_env=merged_env,
                         terminal_counter_ref=terminal_counter_ref,
                         add_event=lambda e: None, timeout=10,
                     )
@@ -433,6 +444,7 @@ async def run_acp_session(
             policy=policy, workdir=workdir, workdir_resolved=workdir_resolved,
             path_ok=_path_ok, terminals=terminals,
             terminal_outputs=terminal_outputs,
+            merged_env=merged_env,
             terminal_counter_ref=terminal_counter_ref,
             add_event=_add_event, timeout=timeout,
         )
@@ -514,6 +526,7 @@ async def _message_loop(
     path_ok: Callable[[str], bool],
     terminals: dict[str, asyncio.subprocess.Process],
     terminal_outputs: dict[str, str],
+    merged_env: dict[str, str],
     terminal_counter_ref: list[int],
     add_event: Callable[[ACPEvent], None],
     timeout: float,
@@ -634,6 +647,7 @@ async def _message_loop(
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.STDOUT,
                     cwd=cwd,
+                    env=merged_env,
                 )
                 terminals[tid] = tproc
                 terminal_outputs[tid] = ""
@@ -720,6 +734,7 @@ def run_acp_session_sync(
     model: Optional[str] = None,
     effort: Optional[str] = None,
     mode: Optional[str] = None,
+    env: Optional[dict[str, str]] = None,
     permission_policy: Optional[PermissionPolicy] = None,
     on_event: Optional[Callable[[ACPEvent], None]] = None,
 ) -> ACPResult:
@@ -737,6 +752,7 @@ def run_acp_session_sync(
         model=model,
         effort=effort,
         mode=mode,
+        env=env,
         permission_policy=permission_policy,
         on_event=on_event,
     ))
