@@ -39,29 +39,71 @@ agent-server --wrapper --tunnel --register https://your-dashboard.example.com
 agent-server --wrapper
 ```
 
-## API
+## API reference
 
-### Command Execution
+### Authentication
+
+- `GET /health` works without an API key, but unauthenticated callers only get a minimal response:
+  `{"status":"ok","authenticated":false}`
+- All other endpoints require `X-API-Key`.
+- With a valid API key, `GET /health` returns the full server capabilities payload.
+
+### `POST /exec`
+
+Submit a shell or ACP job. Successful requests return `202 Accepted` with:
+
+```json
+{"jobId":"abc123","status":"pending"}
+```
+
+Common request fields:
+
+| Field | Type | Required | Notes |
+|---|---|---:|---|
+| `mode` | string | no | `"shell"` by default; set to `"acp"` for ACP mode |
+| `workdir` | string | no | Working directory for the child process |
+| `timeout` | integer | no | Timeout in seconds; defaults to `300` |
+| `env` | object | no | Optional environment overlay. Keys and values must both be strings or the request fails with `400`. |
+
+#### Shell mode
+
+Shell mode runs the `command` in a background subprocess.
+
+| Field | Type | Required | Notes |
+|---|---|---:|---|
+| `command` | string | yes | Shell command to execute |
+
+Example:
 
 ```bash
-# Submit a command
 curl -X POST http://localhost:8585/exec \
   -H "X-API-Key: $KEY" \
   -H "Content-Type: application/json" \
-  -d '{"command": "echo hello", "workdir": "/path/to/repo", "timeout": 300}'
-# → {"jobId": "abc123", "status": "pending"}
-
-# Poll for results
-curl http://localhost:8585/jobs/abc123 -H "X-API-Key: $KEY"
-# → {"status": "completed", "exitCode": 0, "stdout": "hello\n", ...}
-
-# Nudge a stalled process (writes to stdin)
-curl -X POST http://localhost:8585/jobs/abc123/nudge -H "X-API-Key: $KEY"
+  -d '{
+    "command": "python -c \"import os; print(os.environ.get(\\\"DEVPILOT_TEST_ENV\\\", \\\"\\\"))\"",
+    "workdir": "C:/src/repo",
+    "timeout": 300,
+    "env": {
+      "DEVPILOT_TEST_ENV": "hello-from-env"
+    }
+  }'
 ```
 
-### ACP Mode
+The `env` overlay is merged onto the runtime process environment before the shell subprocess starts.
 
-Submit commands in ACP mode for structured output from any ACP-compatible agent:
+#### ACP mode
+
+ACP mode launches an ACP-compatible agent and returns structured execution results.
+
+| Field | Type | Required | Notes |
+|---|---|---:|---|
+| `agent` | string | no | ACP launcher command; defaults to `copilot --acp --stdio` |
+| `prompt` | string | no | Prompt text to send after session creation/load |
+| `acp_session_id` | string | no | Resume an existing ACP session |
+| `model` | string | no | ACP config option |
+| `effort` | string | no | ACP reasoning effort |
+
+Example:
 
 ```bash
 curl -X POST http://localhost:8585/exec \
@@ -71,17 +113,109 @@ curl -X POST http://localhost:8585/exec \
     "mode": "acp",
     "agent": "copilot --acp --stdio",
     "prompt": "Implement the login feature",
-    "workdir": "/path/to/repo"
+    "workdir": "C:/src/repo",
+    "env": {
+      "DOTNET_ROOT": "C:/Users/alice/AppData/Local/Microsoft/dotnet"
+    }
   }'
 ```
 
-ACP responses include structured events, tool calls, and session IDs instead of raw stdout.
+In ACP mode, the `env` overlay is applied to:
 
-### Health Check
+- the ACP agent subprocess itself
+- any terminal subprocesses created through ACP `terminal/create`
+
+### `GET /jobs/{id}`
+
+Poll a single job by ID.
+
+Common response fields:
+
+| Field | Type | Notes |
+|---|---|---|
+| `jobId` | string | Job identifier |
+| `status` | string | `pending`, `running`, `completed`, `failed`, or `timeout` |
+| `command` | string | Original shell command or `[acp] ...` launcher |
+| `submittedAt` | number | Unix timestamp |
+| `lastOutputAt` | number | Updated when output arrives |
+| `processAlive` | boolean | Whether the tracked subprocess is still running |
+
+Shell jobs add fields such as `stdout`, `stderr`, `exitCode`, `durationMs`, and `timedOut`.
+
+ACP jobs add fields such as:
+
+- `acpSessionId`
+- `stopReason`
+- `events`
+- `acpError` (when ACP execution fails)
+
+Example:
+
+```bash
+curl http://localhost:8585/jobs/abc123 -H "X-API-Key: $KEY"
+```
+
+### `GET /jobs`
+
+Returns the most recent jobs (up to 20), newest first. Each item is the same sanitized shape returned by `GET /jobs/{id}`.
+
+### `POST /jobs/{id}/nudge`
+
+Writes a newline to the running job's stdin. This is mainly useful for shell commands that are waiting for input or need output to flush.
+
+Example:
+
+```bash
+curl -X POST http://localhost:8585/jobs/abc123/nudge -H "X-API-Key: $KEY"
+```
+
+Response shape:
+
+```json
+{"nudged":true,"processAlive":true}
+```
+
+If the process is already finished or no stdin is available, the endpoint returns `nudged: false` with a reason.
+
+### `GET /health`
+
+Unauthenticated example:
 
 ```bash
 curl http://localhost:8585/health
-# → {"status": "ok", "version": "0.1.0", "acp_supported": true, ...}
+```
+
+```json
+{"status":"ok","authenticated":false}
+```
+
+Authenticated example:
+
+```bash
+curl http://localhost:8585/health -H "X-API-Key: $KEY"
+```
+
+```json
+{
+  "status": "ok",
+  "version": "0.2.1",
+  "hostname": "devbox-01",
+  "jobs": 0,
+  "cwd": "C:\\\\src\\\\agent-runtime",
+  "authenticated": true,
+  "terminal_supported": true,
+  "terminal_sessions": 0,
+  "acp_supported": true,
+  "execution_modes": ["shell", "acp"]
+}
+```
+
+### `POST /update`
+
+Triggers a graceful restart for self-update. The server returns `409` instead when jobs are still running or terminal sessions are active.
+
+```bash
+curl -X POST http://localhost:8585/update -H "X-API-Key: $KEY"
 ```
 
 ## ACP Client (Standalone)
@@ -96,6 +230,7 @@ result = run_acp_session_sync(
     prompt="Refactor the auth module",
     workdir="/path/to/repo",
     timeout=600,
+    env={"DOTNET_ROOT": "/home/alice/.dotnet"},
     permission_policy=HeadlessApprovePolicy("/path/to/repo"),
 )
 
@@ -104,6 +239,8 @@ print(result.session_id)        # For session continuity
 print(result.tool_calls)        # Structured tool call data
 print(result.stop_reason)       # "end_turn", "timeout", "error"
 ```
+
+`env` is optional and overlays string key/value pairs onto the current process environment for the ACP agent subprocess and ACP-created terminal subprocesses.
 
 ## Architecture
 
@@ -146,7 +283,7 @@ print(result.stop_reason)       # "end_turn", "timeout", "error"
 
 | Environment Variable | Default | Description |
 |---------------------|---------|-------------|
-| `DEVPILOT_AGENT_API_KEY` | auto-generated | API key for authenticating requests |
+| `agent_runtime_API_KEY` | auto-generated | API key for authenticating requests |
 | `DEVPILOT_TUNNEL_URL` | — | Devtunnel URL (set automatically with `--tunnel`) |
 | `DEVPILOT_TUNNEL_TOKEN` | — | Devtunnel access token |
 
@@ -156,32 +293,48 @@ Apache 2.0 — see [LICENSE](LICENSE) for details.
 
 ## Releasing
 
-Releases are automated via GitHub Actions. When a version tag is pushed,
-CI runs tests → builds the wheel → publishes to PyPI using Trusted Publisher (OIDC).
+Releases are automated via GitHub Actions. The checked-in publish workflow runs when a version tag is pushed, and the normal flow is:
+
+1. Bump `agent_runtime/__init__.py`
+2. Run tests and build locally
+3. Commit and push `main`
+4. Fast-forward and push the `release` branch
+5. Push `vX.Y.Z` to trigger PyPI publish
+
+Example for `0.2.1`:
 
 ```bash
-# 1. Create a release branch
-git checkout -b release/v0.2.0
+# 1. Bump version in agent_runtime/__init__.py
+#    __version__ = "0.2.1"
 
-# 2. Bump version in agent_runtime/__init__.py
-#    __version__ = "0.2.0"
+# 2. Validate the release locally
+python -m pytest tests/ -q
+python -m build
 
-# 3. Commit and push
-git add agent_runtime/__init__.py
-git commit -m "Bump version to 0.2.0"
-git push origin release/v0.2.0
-
-# 4. Merge to main (via PR or direct push)
+# 3. Commit and push main
 git checkout main
-git merge release/v0.2.0
+git add agent_runtime/__init__.py README.md agent_runtime/ tests/
+git commit -m "Release 0.2.1"
 git push origin main
 
-# 5. Tag and push — this triggers the PyPI publish
-git tag v0.2.0
-git push origin v0.2.0
+# 4. Fast-forward the shared release branch
+git checkout release
+git merge --ff-only main
+git push origin release
+
+# 5. Push the version tag — this triggers .github/workflows/publish.yml
+git checkout main
+git tag v0.2.1
+git push origin refs/tags/v0.2.1
 ```
 
-The publish workflow: runs tests (Windows, Python 3.11-3.13) → builds sdist + wheel → publishes to PyPI.
+The publish workflow runs:
+
+1. Windows tests
+2. Source distribution + wheel build
+3. PyPI publish via Trusted Publisher
+
+`twine upload` is not the normal release path for this repo.
 
 **First-time setup** (one-time on pypi.org):
 1. Go to `pypi.org/manage/project/devpilot-agent/settings/publishing/`
