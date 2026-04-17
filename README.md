@@ -447,18 +447,18 @@ The publish workflow runs:
 
 1. Windows tests
 2. Source distribution + wheel build
-3. PyPI publish via Trusted Publisher
+3. PyPI publish via the `PYPI_API_TOKEN` GitHub secret
 
-If Trusted Publisher is unavailable, the fallback is:
+If the GitHub secret is not configured or you want to publish directly from a workstation, the fallback is:
 
 ```bash
 python -m build
 python -m twine upload dist/devpilot_agent-0.3.0*
 ```
 
-Use a PyPI API token for `twine upload`. The preferred path is still the tag-triggered GitHub Actions publish.
+Use a PyPI API token for `twine upload`.
 
-**First-time setup** (one-time on pypi.org):
-1. Go to `pypi.org/manage/project/devpilot-agent/settings/publishing/`
-2. Add trusted publisher: owner=`joerob-msft`, repo=`agent-runtime`, workflow=`publish.yml`, environment=`pypi`
-3. Create a `pypi` environment in GitHub repo settings (Settings → Environments → New)
+**GitHub Actions setup**:
+1. In the `agent-runtime` GitHub repo, add a repository secret named `PYPI_API_TOKEN`
+2. Set the value to a PyPI API token for the `devpilot-agent` project
+3. Push a `v*` tag or run `Publish to PyPI` manually with `ref=v0.3.0` (or the tag/commit you want to publish)
