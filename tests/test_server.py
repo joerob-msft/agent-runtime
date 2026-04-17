@@ -17,7 +17,11 @@ from agent_runtime.server import (
     _run_acp_command,
 )
 from agent_runtime.acp_client import ACPResult
+from agent_runtime.persistent_shell import preferred_shell_kind
 import agent_runtime.server as _server_module
+
+
+PREFERRED_SHELL = preferred_shell_kind()
 
 
 def _start_test_server(api_key: str = "") -> tuple[HTTPServer, int, threading.Thread]:
@@ -29,6 +33,7 @@ def _start_test_server(api_key: str = "") -> tuple[HTTPServer, int, threading.Th
         import secrets as _secrets
         api_key = _secrets.token_urlsafe(16)
     _server_module._api_key = api_key
+    _server_module._persistent_shells.close_all()
     server = HTTPServer(("127.0.0.1", 0), CommandHandler)
     port = server.server_address[1]
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -117,11 +122,28 @@ class TestHealthVersion:
         finally:
             server.shutdown()
 
+    def test_health_includes_persistent_shell_fields(self):
+        server, port, _ = _start_test_server()
+        try:
+            api_key = _server_module._api_key
+            data = _get(port, "/health", api_key=api_key)
+            assert "persistent_shell_supported" in data
+            assert "persistent_shell_shells" in data
+            assert "persistent_shell_default_shell" in data
+            assert "persistent_shell_sessions" in data
+            assert "persistent_shell_max_sessions" in data
+            assert "persistent_shell_idle_timeout_seconds" in data
+            if data["persistent_shell_supported"]:
+                assert "persistent_shell" in data["execution_modes"]
+        finally:
+            server.shutdown()
+
 
 class TestUpdateEndpoint:
     def _clear_jobs(self):
         with _jobs_lock:
             _jobs.clear()
+        _server_module._persistent_shells.close_all()
 
     def test_update_rejects_when_jobs_running(self):
         server, port, _ = _start_test_server()
@@ -200,6 +222,44 @@ class TestUpdateEndpoint:
 
                 time.sleep(2)
                 mock_exit.assert_called_once()
+        finally:
+            self._clear_jobs()
+            server.shutdown()
+
+    def test_update_rejects_when_persistent_sessions_exist(self):
+        if PREFERRED_SHELL is None:
+            self.skipTest("No supported persistent shell host available")
+
+        server, port, _ = _start_test_server()
+        try:
+            api_key = _server_module._api_key
+            self._clear_jobs()
+
+            status, data = _post(
+                port,
+                "/exec",
+                {
+                    "mode": "persistent_shell",
+                    "sessionKey": "update-session",
+                    "shell": PREFERRED_SHELL,
+                    "command": "Write-Output 'seeded'",
+                    "timeout": 10,
+                },
+                api_key=api_key,
+            )
+            assert status == 202
+            job_id = data["jobId"]
+
+            for _ in range(20):
+                time.sleep(0.5)
+                result = _get(port, f"/jobs/{job_id}", api_key=api_key)
+                if result["status"] in ("completed", "failed", "timeout"):
+                    break
+
+            assert result["status"] == "completed"
+            status, data = _post(port, "/update", api_key=api_key)
+            assert status == 409
+            assert data["persistent_sessions"] == 1
         finally:
             self._clear_jobs()
             server.shutdown()
@@ -310,6 +370,7 @@ class TestExecAndPoll:
     def _clear_jobs(self):
         with _jobs_lock:
             _jobs.clear()
+        _server_module._persistent_shells.close_all()
 
     def test_exec_echo_completes(self):
         server, port, _ = _start_test_server()
@@ -474,6 +535,223 @@ class TestExecAndPoll:
             assert _jobs["acp-job"]["status"] == "completed"
         self._clear_jobs()
 
+    def test_run_acp_command_passes_persistent_session_to_client(self):
+        self._clear_jobs()
+        with _jobs_lock:
+            _jobs["acp-job"] = {"jobId": "acp-job", "status": "pending"}
+
+        with patch("agent_runtime.acp_client.run_acp_session_sync") as mock_run:
+            mock_run.return_value = ACPResult(
+                session_id="session-123",
+                stop_reason="no_prompt",
+                output_text="",
+                stderr="",
+                events=[],
+            )
+
+            _run_acp_command(
+                "acp-job",
+                "agent-server --stdio",
+                "",
+                os.getcwd(),
+                10,
+                None,
+                None,
+                None,
+                {"DEVPILOT_TEST_ENV": "acp-visible"},
+                "workflow-a",
+                PREFERRED_SHELL,
+            )
+
+        assert mock_run.call_count == 1
+        assert mock_run.call_args.kwargs["persistent_session_key"] == "workflow-a"
+        assert mock_run.call_args.kwargs["persistent_shell"] == PREFERRED_SHELL
+        self._clear_jobs()
+
+
+class TestPersistentShellAPI:
+    """Test the public persistent shell execution and session endpoints."""
+
+    def _clear_jobs(self):
+        with _jobs_lock:
+            _jobs.clear()
+        _server_module._persistent_shells.close_all()
+
+    def test_exec_persistent_shell_requires_shell(self):
+        server, port, _ = _start_test_server()
+        try:
+            api_key = _server_module._api_key
+            status, data = _post(
+                port,
+                "/exec",
+                {
+                    "mode": "persistent_shell",
+                    "sessionKey": "missing-shell",
+                    "command": "Write-Output 'hello'",
+                },
+                api_key=api_key,
+            )
+            assert status == 400
+            assert data["error"] == "shell is required"
+        finally:
+            self._clear_jobs()
+            server.shutdown()
+
+    def test_exec_persistent_shell_persists_state(self):
+        if PREFERRED_SHELL is None:
+            self.skipTest("No supported persistent shell host available")
+
+        server, port, _ = _start_test_server()
+        try:
+            api_key = _server_module._api_key
+            self._clear_jobs()
+
+            status, data = _post(
+                port,
+                "/exec",
+                {
+                    "mode": "persistent_shell",
+                    "sessionKey": "workflow-a",
+                    "shell": PREFERRED_SHELL,
+                    "command": (
+                        "function Get-WorkflowValue { 'persisted-function' }\n"
+                        "$env:DEVPILOT_TEST_ENV = 'persisted-env'\n"
+                        "Write-Output 'seeded'"
+                    ),
+                    "timeout": 15,
+                },
+                api_key=api_key,
+            )
+            assert status == 202
+            first_job_id = data["jobId"]
+
+            for _ in range(20):
+                time.sleep(0.5)
+                result = _get(port, f"/jobs/{first_job_id}", api_key=api_key)
+                if result["status"] in ("completed", "failed", "timeout"):
+                    break
+
+            assert result["status"] == "completed"
+
+            status, data = _post(
+                port,
+                "/exec",
+                {
+                    "mode": "persistent_shell",
+                    "sessionKey": "workflow-a",
+                    "shell": PREFERRED_SHELL,
+                    "command": (
+                        "Write-Output (Get-WorkflowValue)\n"
+                        "Write-Output $env:DEVPILOT_TEST_ENV"
+                    ),
+                    "timeout": 15,
+                },
+                api_key=api_key,
+            )
+            assert status == 202
+            second_job_id = data["jobId"]
+
+            for _ in range(20):
+                time.sleep(0.5)
+                result = _get(port, f"/jobs/{second_job_id}", api_key=api_key)
+                if result["status"] in ("completed", "failed", "timeout"):
+                    break
+
+            assert result["status"] == "completed"
+            assert result["stdout"].splitlines() == [
+                "persisted-function",
+                "persisted-env",
+            ]
+            assert result["processAlive"] is False
+        finally:
+            self._clear_jobs()
+            server.shutdown()
+
+    def test_session_endpoints_report_and_delete_state(self):
+        if PREFERRED_SHELL is None:
+            self.skipTest("No supported persistent shell host available")
+
+        server, port, _ = _start_test_server()
+        try:
+            api_key = _server_module._api_key
+            self._clear_jobs()
+
+            status, data = _post(
+                port,
+                "/exec",
+                {
+                    "mode": "persistent_shell",
+                    "sessionKey": "workflow-session",
+                    "shell": PREFERRED_SHELL,
+                    "command": "Write-Output 'seeded'",
+                    "timeout": 15,
+                },
+                api_key=api_key,
+            )
+            assert status == 202
+            job_id = data["jobId"]
+
+            for _ in range(20):
+                time.sleep(0.5)
+                result = _get(port, f"/jobs/{job_id}", api_key=api_key)
+                if result["status"] in ("completed", "failed", "timeout"):
+                    break
+
+            assert result["status"] == "completed"
+
+            sessions = _get(port, "/sessions", api_key=api_key)
+            assert len(sessions) == 1
+            assert sessions[0]["sessionKey"] == "workflow-session"
+            assert sessions[0]["shell"] == PREFERRED_SHELL
+            assert sessions[0]["status"] == "idle"
+
+            session = _get(port, "/sessions/workflow-session", api_key=api_key)
+            assert session["sessionKey"] == "workflow-session"
+            assert session["shell"] == PREFERRED_SHELL
+            assert session["processAlive"] is True
+            assert session["activeCommand"] is False
+
+            status, data = _post(
+                port,
+                "/exec",
+                {
+                    "mode": "persistent_shell",
+                    "sessionKey": "workflow-session",
+                    "shell": PREFERRED_SHELL,
+                    "command": (
+                        "function Get-DeleteValue { 'present' }\n"
+                        "Write-Output 'ready'"
+                    ),
+                    "timeout": 15,
+                },
+                api_key=api_key,
+            )
+            assert status == 202
+            job_id = data["jobId"]
+
+            for _ in range(20):
+                time.sleep(0.5)
+                result = _get(port, f"/jobs/{job_id}", api_key=api_key)
+                if result["status"] in ("completed", "failed", "timeout"):
+                    break
+
+            import urllib.request
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/sessions/workflow-session",
+                method="DELETE",
+                headers={"X-API-Key": api_key},
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                delete_data = json.loads(resp.read().decode("utf-8"))
+                assert resp.status == 200
+                assert delete_data["deleted"] is True
+
+            status, data = _get_status(port, "/sessions/workflow-session", api_key=api_key)
+            assert status == 404
+        finally:
+            self._clear_jobs()
+            server.shutdown()
+
 
 class TestNudgeEndpoint:
     """Test POST /jobs/{id}/nudge."""
@@ -481,6 +759,7 @@ class TestNudgeEndpoint:
     def _clear_jobs(self):
         with _jobs_lock:
             _jobs.clear()
+        _server_module._persistent_shells.close_all()
 
     def test_nudge_nonexistent_job_returns_404(self):
         server, port, _ = _start_test_server()

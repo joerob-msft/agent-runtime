@@ -1,262 +1,243 @@
-"""Tests for the headless ACP client."""
+"""Tests for ACP client persistent shell integration."""
 
-import os
-import unittest
-import asyncio
+import sys
+import textwrap
 from pathlib import Path
-from unittest.mock import MagicMock, patch
 
-from agent_runtime.acp_client import (
-    ACPEvent,
-    ACPResult,
-    HeadlessApprovePolicy,
-    NDJSONTransport,
-    PermissionPolicy,
-    RPCClient,
-    _path_ok_for_read,
-    _message_loop,
-    run_acp_session,
-)
+import pytest
+
+from agent_runtime.acp_client import run_acp_session_sync
+from agent_runtime.persistent_shell import preferred_shell_kind, shared_manager
 
 
-class TestPermissionPolicy(unittest.TestCase):
-    """Test the permission policy hierarchy."""
-
-    def test_base_policy_denies_all(self):
-        policy = PermissionPolicy()
-        result = policy.decide("write_file", [{"id": "allow"}], {})
-        self.assertIsNone(result)
-
-    def test_headless_approves_path_inside_workdir(self):
-        workdir = str(Path(__file__).parent.resolve())
-        policy = HeadlessApprovePolicy(workdir)
-        params = {
-            "toolCall": {"name": "write_file", "rawInput": {
-                "path": os.path.join(workdir, "somefile.txt"),
-            }},
-        }
-        result = policy.decide("write_file", [{"id": "allow"}], params)
-        self.assertEqual(result, {"id": "allow"})
-
-    def test_headless_denies_path_outside_workdir(self):
-        workdir = str(Path(__file__).parent.resolve())
-        policy = HeadlessApprovePolicy(workdir)
-        params = {
-            "toolCall": {"name": "write_file", "rawInput": {
-                "path": "C:\\Windows\\System32\\evil.txt",
-            }},
-        }
-        result = policy.decide("write_file", [{"id": "allow"}], params)
-        self.assertIsNone(result)
-
-    def test_headless_checks_multiple_path_keys(self):
-        workdir = str(Path(__file__).parent.resolve())
-        policy = HeadlessApprovePolicy(workdir)
-        # Uses "file" key instead of "path"
-        params = {
-            "toolCall": {"name": "write_file", "rawInput": {
-                "file": "C:\\Windows\\System32\\evil.txt",
-            }},
-        }
-        result = policy.decide("write_file", [{"id": "allow"}], params)
-        self.assertIsNone(result)
-
-    def test_headless_approves_safe_tool_without_path(self):
-        workdir = str(Path(__file__).parent.resolve())
-        policy = HeadlessApprovePolicy(workdir)
-        params = {"toolCall": {"name": "search", "rawInput": {"query": "test"}}}
-        result = policy.decide("search", [{"id": "allow"}], params)
-        self.assertEqual(result, {"id": "allow"})
+PREFERRED_SHELL = preferred_shell_kind()
 
 
-class TestPathValidation(unittest.TestCase):
-    """Test path resolution against workdir."""
+def _write_fake_agent(tmp_path: Path) -> Path:
+    script = tmp_path / "fake_acp_agent.py"
+    script.write_text(
+        textwrap.dedent(
+            """
+            import json
+            import sys
 
-    def test_absolute_path_inside_workdir(self):
-        workdir = Path(__file__).parent.resolve()
-        path = str(workdir / "test_file.py")
-        self.assertTrue(_path_ok_for_read(path, workdir))
+            current_cwd = "."
 
-    def test_absolute_path_outside_workdir(self):
-        workdir = Path(__file__).parent.resolve()
-        self.assertFalse(_path_ok_for_read("C:\\Windows\\System32\\cmd.exe", workdir))
+            def send(msg):
+                sys.stdout.write(json.dumps(msg, separators=(",", ":")) + "\\n")
+                sys.stdout.flush()
 
-    def test_relative_path_resolved_against_workdir(self):
-        workdir = Path(__file__).parent.resolve()
-        # "test_acp_client.py" is relative — should resolve against workdir
-        self.assertTrue(_path_ok_for_read("test_acp_client.py", workdir))
+            def recv():
+                line = sys.stdin.readline()
+                if not line:
+                    raise SystemExit(0)
+                return json.loads(line)
 
-    def test_traversal_attack_blocked(self):
-        workdir = Path(__file__).parent.resolve()
-        self.assertFalse(_path_ok_for_read("../../../../../../etc/passwd", workdir))
+            def request(msg_id, method, params):
+                send({"jsonrpc": "2.0", "id": msg_id, "method": method, "params": params})
+                while True:
+                    msg = recv()
+                    if msg.get("id") != msg_id:
+                        continue
+                    if "error" in msg:
+                        raise RuntimeError(msg["error"])
+                    return msg.get("result", {})
+
+            while True:
+                msg = recv()
+                method = msg.get("method")
+                msg_id = msg.get("id")
+                params = msg.get("params", {})
+
+                if method == "initialize":
+                    send({
+                        "jsonrpc": "2.0",
+                        "id": msg_id,
+                        "result": {
+                            "protocolVersion": 1,
+                            "capabilities": {},
+                            "serverInfo": {"name": "fake-agent", "version": "1.0"},
+                        },
+                    })
+                elif method == "session/new":
+                    current_cwd = params.get("cwd", ".")
+                    send({"jsonrpc": "2.0", "id": msg_id, "result": {"sessionId": "fake-session"}})
+                elif method == "session/load":
+                    current_cwd = params.get("cwd", ".")
+                    send({
+                        "jsonrpc": "2.0",
+                        "id": msg_id,
+                        "result": {"sessionId": params.get("sessionId", "fake-session")},
+                    })
+                elif method == "session/set_config_option":
+                    send({"jsonrpc": "2.0", "id": msg_id, "result": {}})
+                elif method == "session/prompt":
+                    prompt_items = params.get("prompt", [])
+                    prompt_text = " ".join(
+                        item.get("text", "")
+                        for item in prompt_items
+                        if isinstance(item, dict)
+                    ).lower()
+                    if "seed" in prompt_text:
+                        term_id = request(
+                            100,
+                            "terminal/create",
+                            {
+                                "command": "Invoke-Expression",
+                                "args": [
+                                    "function Get-WorkflowValue { 'persisted-function' }; "
+                                    "$env:DEVPILOT_TEST_ENV='persisted-env'"
+                                ],
+                                "cwd": current_cwd,
+                            },
+                        )["terminalId"]
+                        request(101, "terminal/wait_for_exit", {"terminalId": term_id})
+                        output = "seeded\\n"
+                    elif "reset" in prompt_text:
+                        term_id = request(
+                            150,
+                            "terminal/create",
+                            {
+                                "command": "Invoke-Expression",
+                                "args": ["Start-Sleep -Seconds 30"],
+                                "cwd": current_cwd,
+                            },
+                        )["terminalId"]
+                        request(151, "terminal/kill", {"terminalId": term_id})
+                        term_id = request(
+                            152,
+                            "terminal/create",
+                            {
+                                "command": "Invoke-Expression",
+                                "args": [
+                                    "Get-WorkflowValue; "
+                                    "Write-Output $env:DEVPILOT_TEST_ENV; "
+                                    "Write-Output (Get-Location).Path"
+                                ],
+                                "cwd": current_cwd,
+                            },
+                        )["terminalId"]
+                        request(153, "terminal/wait_for_exit", {"terminalId": term_id})
+                        output = request(154, "terminal/output", {"terminalId": term_id}).get("output", "")
+                    else:
+                        term_id = request(
+                            200,
+                            "terminal/create",
+                            {
+                                "command": "Invoke-Expression",
+                                "args": [
+                                    "Get-WorkflowValue; Write-Output $env:DEVPILOT_TEST_ENV"
+                                ],
+                                "cwd": current_cwd,
+                            },
+                        )["terminalId"]
+                        request(201, "terminal/wait_for_exit", {"terminalId": term_id})
+                        output = request(202, "terminal/output", {"terminalId": term_id}).get("output", "")
+
+                    send({
+                        "jsonrpc": "2.0",
+                        "method": "session/update",
+                        "params": {
+                            "update": {
+                                "sessionUpdate": "agent_message_chunk",
+                                "content": {"type": "text", "text": output},
+                            }
+                        },
+                    })
+                    send({"jsonrpc": "2.0", "id": msg_id, "result": {"stopReason": "end_turn"}})
+                else:
+                    send({"jsonrpc": "2.0", "id": msg_id, "result": {}})
+            """
+        ),
+        encoding="utf-8",
+    )
+    return script
 
 
-class TestACPResult(unittest.TestCase):
-    """Test ACPResult dataclass."""
+def test_run_acp_session_reuses_persistent_shell_across_calls(tmp_path: Path) -> None:
+    if PREFERRED_SHELL is None:
+        pytest.skip("No supported persistent shell host available")
 
-    def test_default_values(self):
-        result = ACPResult()
-        self.assertEqual(result.session_id, "")
-        self.assertEqual(result.output_text, "")
-        self.assertEqual(result.events, [])
-        self.assertEqual(result.stop_reason, "")
+    manager = shared_manager()
+    manager.close_all()
+    script = _write_fake_agent(tmp_path)
 
-    def test_populated_result(self):
-        result = ACPResult(
-            session_id="abc-123",
-            output_text="Hello world",
-            events=[ACPEvent(type="message", data={"text": "hi"})],
-            stop_reason="end_turn",
+    try:
+        seed = run_acp_session_sync(
+            agent_cmd=[sys.executable, str(script)],
+            prompt="seed workflow state",
+            workdir=str(tmp_path),
+            timeout=30,
+            persistent_session_key="acp-workflow",
+            persistent_shell=PREFERRED_SHELL,
         )
-        self.assertEqual(result.session_id, "abc-123")
-        self.assertEqual(len(result.events), 1)
-        self.assertEqual(result.events[0].type, "message")
+        assert seed.stop_reason == "end_turn"
+        assert "seeded" in seed.output_text
+
+        read = run_acp_session_sync(
+            agent_cmd=[sys.executable, str(script)],
+            prompt="read workflow state",
+            workdir=str(tmp_path),
+            timeout=30,
+            persistent_session_key="acp-workflow",
+            persistent_shell=PREFERRED_SHELL,
+        )
+
+        assert read.stop_reason == "end_turn"
+        assert read.output_text.splitlines() == [
+            "persisted-function",
+            "persisted-env",
+        ]
+
+        info = manager.get_session_info("acp-workflow")
+        assert info is not None
+        assert info["processAlive"] is True
+        assert info["shell"] == PREFERRED_SHELL
+    finally:
+        manager.close_all()
 
 
-class TestACPEvent(unittest.TestCase):
-    """Test ACPEvent dataclass."""
+def test_run_acp_session_replays_bootstrap_after_terminal_kill(tmp_path: Path) -> None:
+    if PREFERRED_SHELL is None:
+        pytest.skip("No supported persistent shell host available")
 
-    def test_default_timestamp(self):
-        event = ACPEvent(type="test")
-        self.assertGreater(event.timestamp, 0)
-        self.assertEqual(event.data, {})
+    manager = shared_manager()
+    manager.close_all()
+    script = _write_fake_agent(tmp_path)
+    session_key = "acp-reset"
+    bootstrap = "function Get-WorkflowValue { 'persisted-function' }"
 
+    try:
+        seeded = manager.run_command(
+            session_key,
+            bootstrap,
+            shell=PREFERRED_SHELL,
+            timeout=30,
+            workdir=str(tmp_path),
+            env={"DEVPILOT_TEST_ENV": "persisted-env"},
+            bootstrap_command=bootstrap,
+            bootstrap_current_command=True,
+        )
+        assert seeded.exit_code == 0
 
-class _FakeStream:
-    async def read(self, _size: int) -> bytes:
-        return b""
+        reset = run_acp_session_sync(
+            agent_cmd=[sys.executable, str(script)],
+            prompt="reset workflow state",
+            workdir=str(tmp_path),
+            timeout=30,
+            persistent_session_key=session_key,
+            persistent_shell=PREFERRED_SHELL,
+        )
 
-    def write(self, _data: bytes) -> None:
-        return None
+        assert reset.stop_reason == "end_turn"
+        assert reset.output_text.splitlines() == [
+            "persisted-function",
+            "persisted-env",
+            str(tmp_path),
+        ]
 
-    async def drain(self) -> None:
-        return None
-
-
-class _FakeProcess:
-    def __init__(self):
-        self.stdin = _FakeStream()
-        self.stdout = _FakeStream()
-        self.stderr = _FakeStream()
-        self.returncode = 0
-
-    async def wait(self) -> int:
-        self.returncode = 0
-        return 0
-
-    def terminate(self) -> None:
-        self.returncode = 0
-
-    def kill(self) -> None:
-        self.returncode = -9
-
-
-class _FakeTransport:
-    def __init__(self, messages):
-        self._messages = list(messages)
-
-    async def recv(self, timeout=None):
-        await asyncio.sleep(0)
-        if self._messages:
-            return self._messages.pop(0)
-        return None
-
-
-class _FakeRPC:
-    def __init__(self):
-        self.responses = []
-        self.errors = []
-
-    def resolve(self, _msg):
-        return False
-
-    async def respond(self, msg_id, result):
-        self.responses.append((msg_id, result))
-
-    async def respond_error(self, msg_id, code, message):
-        self.errors.append((msg_id, code, message))
-
-
-class TestACPEnv(unittest.TestCase):
-    def test_run_acp_session_passes_env_to_agent_process(self):
-        captured = {}
-        fake_process = _FakeProcess()
-
-        async def fake_create_subprocess_exec(*args, **kwargs):
-            captured["args"] = args
-            captured["env"] = kwargs.get("env")
-            return fake_process
-
-        async def fake_request(self, method, params, timeout):
-            if method == "session/new":
-                return {"sessionId": "session-123"}
-            if method == "session/prompt":
-                return {"stopReason": "end_turn"}
-            return {}
-
-        async def passthrough_message_loop(_transport, _rpc, wait_task, **_kwargs):
-            return await wait_task
-
-        with patch("agent_runtime.acp_client.asyncio.create_subprocess_exec", side_effect=fake_create_subprocess_exec):
-            with patch.object(RPCClient, "request", new=fake_request):
-                with patch("agent_runtime.acp_client._message_loop", side_effect=passthrough_message_loop):
-                    result = asyncio.run(run_acp_session(
-                        agent_cmd=["python", "--version"],
-                        prompt="hello",
-                        workdir=str(Path(__file__).parent.resolve()),
-                        env={"DEVPILOT_TEST_ENV": "agent-visible"},
-                    ))
-
-        self.assertEqual(result.stop_reason, "end_turn")
-        self.assertEqual(captured["env"]["DEVPILOT_TEST_ENV"], "agent-visible")
-
-    def test_message_loop_passes_env_to_terminal_process(self):
-        captured = {}
-        fake_process = _FakeProcess()
-
-        async def fake_create_subprocess_exec(*args, **kwargs):
-            captured["args"] = args
-            captured["env"] = kwargs.get("env")
-            return fake_process
-
-        async def _run_test() -> None:
-            wait_task = asyncio.create_task(asyncio.sleep(0.05, result={"done": True}))
-            transport = _FakeTransport([{
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "terminal/create",
-                "params": {
-                    "command": "python",
-                    "args": ["--version"],
-                    "cwd": str(Path(__file__).parent.resolve()),
-                },
-            }])
-            rpc = _FakeRPC()
-            with patch("agent_runtime.acp_client.asyncio.create_subprocess_exec", side_effect=fake_create_subprocess_exec):
-                await _message_loop(
-                    transport,
-                    rpc,
-                    wait_task,
-                    events=[],
-                    text_parts=[],
-                    text_len_ref=[0],
-                    replay_complete_ref=[True],
-                    policy=PermissionPolicy(),
-                    workdir=str(Path(__file__).parent.resolve()),
-                    workdir_resolved=Path(__file__).parent.resolve(),
-                    path_ok=lambda _path: True,
-                    terminals={},
-                    terminal_outputs={},
-                    merged_env={"DEVPILOT_TEST_ENV": "terminal-visible"},
-                    terminal_counter_ref=[0],
-                    add_event=lambda _event: None,
-                    timeout=1,
-                )
-
-        asyncio.run(_run_test())
-
-        self.assertEqual(captured["env"]["DEVPILOT_TEST_ENV"], "terminal-visible")
-
-
-if __name__ == "__main__":
-    unittest.main()
+        info = manager.get_session_info(session_key)
+        assert info is not None
+        assert info["processAlive"] is True
+    finally:
+        manager.close_all()

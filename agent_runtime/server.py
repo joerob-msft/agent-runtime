@@ -17,8 +17,16 @@ import threading
 import time
 import uuid
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import unquote
 
 from agent_runtime import __version__ as _VERSION
+from agent_runtime.persistent_shell import (
+    available_shells as _available_persistent_shells,
+    normalize_shell_kind,
+    persistent_shell_supported,
+    preferred_shell_kind,
+    shared_manager as _shared_persistent_shell_manager,
+)
 
 # Exit code that signals the wrapper/CLI to pull updates and restart
 RESTART_EXIT_CODE = 42
@@ -53,6 +61,9 @@ _jobs_lock = threading.Lock()
 
 # Max jobs to keep in memory
 MAX_JOBS = 100
+
+# Headless persistent shell sessions (separate from browser terminal PTYs)
+_persistent_shells = _shared_persistent_shell_manager()
 
 # API key for authenticating dashboard requests (set on startup)
 _api_key: str = ""
@@ -116,6 +127,19 @@ def _merged_env(env: dict[str, str] | None) -> dict[str, str]:
     if env:
         merged.update(env)
     return merged
+
+
+def _job_process_alive(job: dict) -> bool:
+    """Return whether the job still has an active running process."""
+    thread = job.get("_thread")
+    if thread is not None and thread.is_alive():
+        return True
+    session_key = job.get("_persistentSessionKey")
+    if isinstance(session_key, str):
+        info = _persistent_shells.get_session_info(session_key)
+        return bool(info and info.get("activeCommand"))
+    proc = job.get("_process")
+    return proc is not None and proc.poll() is None
 
 
 def _reader_thread(stream, chunks: list, job_id: str) -> None:
@@ -235,6 +259,70 @@ def _run_command(
             _jobs[job_id].pop("_process", None)
 
 
+def _run_persistent_shell_command(
+    job_id: str,
+    session_key: str,
+    shell: str,
+    command: str,
+    workdir: str,
+    timeout: int,
+    env: dict[str, str] | None = None,
+    bootstrap_command: str = "",
+    bootstrap_current_command: bool = False,
+) -> None:
+    """Execute a command inside a named persistent shell session."""
+    start = time.time()
+
+    with _jobs_lock:
+        _jobs[job_id]["status"] = "running"
+        _jobs[job_id]["lastOutputAt"] = start
+
+    def on_output() -> None:
+        with _jobs_lock:
+            job = _jobs.get(job_id)
+            if job:
+                job["lastOutputAt"] = time.time()
+
+    try:
+        result = _persistent_shells.run_command(
+            session_key,
+            command,
+            shell=shell,
+            timeout=timeout,
+            workdir=workdir,
+            env=env,
+            on_output=on_output,
+            bootstrap_command=bootstrap_command,
+            bootstrap_current_command=bootstrap_current_command,
+        )
+        status = "timeout" if result.timed_out else (
+            "completed" if result.exit_code == 0 else "failed"
+        )
+        with _jobs_lock:
+            job = _jobs.get(job_id)
+            if job:
+                job.update({
+                    "status": status,
+                    "exitCode": result.exit_code,
+                    "stdout": result.stdout,
+                    "stderr": result.stderr,
+                    "durationMs": result.duration_ms,
+                    "timedOut": result.timed_out,
+                })
+    except Exception as e:
+        with _jobs_lock:
+            job = _jobs.get(job_id)
+            if job:
+                job.update({
+                    "status": "failed",
+                    "exitCode": 1,
+                    "stdout": "",
+                    "stderr": str(e),
+                    "durationMs": int((time.time() - start) * 1000),
+                    "timedOut": False,
+                })
+
+
 def _prune_old_jobs() -> None:
     """Remove oldest jobs if we exceed MAX_JOBS."""
     with _jobs_lock:
@@ -259,7 +347,9 @@ def _acp_available() -> bool:
 def _run_acp_command(job_id: str, agent: str, prompt: str, workdir: str,
                      timeout: int, session_id: str | None,
                      model: str | None, effort: str | None,
-                     env: dict[str, str] | None = None) -> None:
+                     env: dict[str, str] | None = None,
+                     persistent_session_key: str | None = None,
+                     persistent_shell: str | None = None) -> None:
     """Run an ACP session in a dedicated thread with its own event loop."""
     import shlex
     from agent_runtime.acp_client import (
@@ -289,6 +379,8 @@ def _run_acp_command(job_id: str, agent: str, prompt: str, workdir: str,
             model=model,
             effort=effort,
             env=env,
+            persistent_session_key=persistent_session_key,
+            persistent_shell=persistent_shell,
             permission_policy=policy,
             on_event=on_event,
         )
@@ -351,6 +443,11 @@ class CommandHandler(BaseHTTPRequestHandler):
             if not self._is_api_key_valid():
                 self._json_response(200, {"status": "ok", "authenticated": False})
                 return
+            execution_modes = ["shell"]
+            if _acp_available():
+                execution_modes.append("acp")
+            if persistent_shell_supported():
+                execution_modes.append("persistent_shell")
             self._json_response(
                 200,
                 {
@@ -363,7 +460,13 @@ class CommandHandler(BaseHTTPRequestHandler):
                     "terminal_supported": _terminal_available(),
                     "terminal_sessions": _terminal_session_count(),
                     "acp_supported": _acp_available(),
-                    "execution_modes": ["shell", "acp"] if _acp_available() else ["shell"],
+                    "execution_modes": execution_modes,
+                    "persistent_shell_supported": persistent_shell_supported(),
+                    "persistent_shell_shells": _available_persistent_shells(),
+                    "persistent_shell_default_shell": preferred_shell_kind(),
+                    "persistent_shell_sessions": _persistent_shells.active_session_count(),
+                    "persistent_shell_max_sessions": _persistent_shells.max_sessions,
+                    "persistent_shell_idle_timeout_seconds": _persistent_shells.idle_timeout,
                 },
             )
             return
@@ -372,14 +475,24 @@ class CommandHandler(BaseHTTPRequestHandler):
         if not self._check_api_key():
             return
 
-        if self.path.startswith("/jobs/"):
+        if self.path == "/sessions":
+            self._json_response(200, _persistent_shells.list_sessions())
+
+        elif self.path.startswith("/sessions/"):
+            session_key = unquote(self.path.split("/sessions/", 1)[1])
+            info = _persistent_shells.get_session_info(session_key)
+            if info is None:
+                self._json_response(404, {"error": "session not found"})
+            else:
+                self._json_response(200, info)
+
+        elif self.path.startswith("/jobs/"):
             job_id = self.path.split("/jobs/", 1)[1]
             with _jobs_lock:
                 job = _jobs.get(job_id)
                 if job is not None:
                     resp = {k: v for k, v in job.items() if not k.startswith("_")}
-                    proc = job.get("_process")
-                    resp["processAlive"] = proc is not None and proc.poll() is None
+                    resp["processAlive"] = _job_process_alive(job)
             if job is None:
                 self._json_response(404, {"error": "job not found"})
             else:
@@ -390,8 +503,7 @@ class CommandHandler(BaseHTTPRequestHandler):
                 jobs_list = []
                 for j in _jobs.values():
                     sanitized = {k: v for k, v in j.items() if not k.startswith("_")}
-                    proc = j.get("_process")
-                    sanitized["processAlive"] = proc is not None and proc.poll() is None
+                    sanitized["processAlive"] = _job_process_alive(j)
                     jobs_list.append(sanitized)
             jobs_list.sort(key=lambda j: j.get("submittedAt", 0), reverse=True)
             self._json_response(200, jobs_list[:20])
@@ -419,6 +531,9 @@ class CommandHandler(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(length)) if length > 0 else {}
 
         mode = body.get("mode", "shell")
+        if mode not in ("shell", "acp", "persistent_shell"):
+            self._json_response(400, {"error": f"unsupported mode: {mode}"})
+            return
         try:
             env = _normalize_env(body.get("env"))
         except ValueError as e:
@@ -437,6 +552,24 @@ class CommandHandler(BaseHTTPRequestHandler):
             acp_session_id = body.get("acp_session_id")
             acp_model = body.get("model")
             acp_effort = body.get("effort")
+            persistent_session_key = body.get("persistent_session_key")
+            persistent_shell = body.get("persistent_shell")
+
+            if persistent_session_key is not None and not isinstance(persistent_session_key, str):
+                self._json_response(400, {"error": "persistent_session_key must be a string"})
+                return
+            if persistent_shell is not None and not isinstance(persistent_shell, str):
+                self._json_response(400, {"error": "persistent_shell must be a string"})
+                return
+            if persistent_session_key:
+                if not persistent_shell:
+                    self._json_response(400, {"error": "persistent_shell is required"})
+                    return
+                try:
+                    persistent_shell = normalize_shell_kind(persistent_shell)
+                except (ValueError, RuntimeError) as e:
+                    self._json_response(400, {"error": str(e)})
+                    return
 
             job_id = uuid.uuid4().hex[:12]
             with _jobs_lock:
@@ -447,13 +580,93 @@ class CommandHandler(BaseHTTPRequestHandler):
                     "mode": "acp",
                     "submittedAt": time.time(),
                 }
+                if persistent_session_key:
+                    _jobs[job_id]["_persistentSessionKey"] = persistent_session_key
+                    _jobs[job_id]["persistentShell"] = persistent_shell
 
             thread = threading.Thread(
                 target=_run_acp_command,
                 args=(job_id, agent, prompt, workdir, timeout,
-                      acp_session_id, acp_model, acp_effort, env),
+                      acp_session_id, acp_model, acp_effort, env,
+                      persistent_session_key or None, persistent_shell or None),
                 daemon=True,
             )
+            with _jobs_lock:
+                if job_id in _jobs:
+                    _jobs[job_id]["_thread"] = thread
+            thread.start()
+            _prune_old_jobs()
+            self._json_response(202, {"jobId": job_id, "status": "pending"})
+            return
+
+        if mode == "persistent_shell":
+            if not persistent_shell_supported():
+                self._json_response(400, {"error": "persistent shell is not available"})
+                return
+            command = body.get("command", "")
+            session_key = body.get("sessionKey", "")
+            shell = body.get("shell", "")
+            workdir = body.get("workdir", "")
+            timeout = body.get("timeout", 300)
+            bootstrap_command = body.get("bootstrapCommand", "")
+            bootstrap_current_command = body.get("bootstrapCurrentCommand", False)
+
+            if not command:
+                self._json_response(400, {"error": "command is required"})
+                return
+            if not isinstance(session_key, str) or not session_key:
+                self._json_response(400, {"error": "sessionKey is required"})
+                return
+            if not isinstance(shell, str) or not shell:
+                self._json_response(400, {"error": "shell is required"})
+                return
+            if bootstrap_command and not isinstance(bootstrap_command, str):
+                self._json_response(400, {"error": "bootstrapCommand must be a string"})
+                return
+            if not isinstance(bootstrap_current_command, bool):
+                self._json_response(
+                    400,
+                    {"error": "bootstrapCurrentCommand must be a boolean"},
+                )
+                return
+            try:
+                shell_kind = normalize_shell_kind(shell)
+            except (ValueError, RuntimeError) as e:
+                self._json_response(400, {"error": str(e)})
+                return
+
+            job_id = uuid.uuid4().hex[:12]
+            with _jobs_lock:
+                _jobs[job_id] = {
+                    "jobId": job_id,
+                    "status": "pending",
+                    "command": command,
+                    "mode": "persistent_shell",
+                    "sessionKey": session_key,
+                    "shell": shell_kind,
+                    "submittedAt": time.time(),
+                    "lastOutputAt": time.time(),
+                    "_persistentSessionKey": session_key,
+                }
+
+            thread = threading.Thread(
+                target=_run_persistent_shell_command,
+                args=(
+                    job_id,
+                    session_key,
+                    shell_kind,
+                    command,
+                    workdir,
+                    timeout,
+                    env,
+                    bootstrap_command,
+                    bootstrap_current_command,
+                ),
+                daemon=True,
+            )
+            with _jobs_lock:
+                if job_id in _jobs:
+                    _jobs[job_id]["_thread"] = thread
             thread.start()
             _prune_old_jobs()
             self._json_response(202, {"jobId": job_id, "status": "pending"})
@@ -482,6 +695,9 @@ class CommandHandler(BaseHTTPRequestHandler):
             args=(job_id, command, workdir, timeout, env),
             daemon=True,
         )
+        with _jobs_lock:
+            if job_id in _jobs:
+                _jobs[job_id]["_thread"] = thread
         thread.start()
 
         _prune_old_jobs()
@@ -497,6 +713,16 @@ class CommandHandler(BaseHTTPRequestHandler):
             job = _jobs.get(job_id)
         if job is None:
             self._json_response(404, {"error": "job not found"})
+            return
+
+        session_key = job.get("_persistentSessionKey")
+        if isinstance(session_key, str):
+            nudged = _persistent_shells.nudge(session_key)
+            self._json_response(200, {
+                "nudged": nudged,
+                "reason": "" if nudged else "persistent session not running",
+                "processAlive": _job_process_alive(job),
+            })
             return
 
         proc = job.get("_process")
@@ -518,6 +744,23 @@ class CommandHandler(BaseHTTPRequestHandler):
                 "reason": str(e),
                 "processAlive": proc.poll() is None,
             })
+
+    def do_DELETE(self) -> None:
+        if not self._check_api_key():
+            return
+
+        if not self.path.startswith("/sessions/"):
+            self._json_response(404, {"error": "not found"})
+            return
+
+        session_key = unquote(self.path.split("/sessions/", 1)[1])
+        info = _persistent_shells.get_session_info(session_key)
+        if info is None:
+            self._json_response(404, {"error": "session not found"})
+            return
+
+        _persistent_shells.close_session(session_key)
+        self._json_response(200, {"deleted": True, "sessionKey": session_key})
 
     def _handle_update(self) -> None:
         """Trigger a graceful restart for update.
@@ -545,6 +788,14 @@ class CommandHandler(BaseHTTPRequestHandler):
             self._json_response(409, {
                 "error": "cannot update while terminal sessions are active",
                 "terminal_sessions": terminal_count,
+            })
+            return
+
+        persistent_sessions = _persistent_shells.active_session_count()
+        if persistent_sessions > 0:
+            self._json_response(409, {
+                "error": "cannot update while persistent shell sessions are active",
+                "persistent_sessions": persistent_sessions,
             })
             return
 
@@ -576,7 +827,10 @@ def start_server(port: int = 8585) -> None:
     _api_key = _init_api_key()
     print(f"DevPilot Agent v{_VERSION}")
     print(f"Listening on 0.0.0.0:{port}")
-    print(f"Endpoints: POST /exec, POST /update, GET /jobs/{{id}}, GET /health")
+    print(
+        "Endpoints: POST /exec, POST /update, "
+        "GET /jobs/{id}, GET /health, GET /sessions, GET/DELETE /sessions/{key}"
+    )
     print(f"API key: configured ({len(_api_key)} chars)")
 
     # Start terminal WebSocket server if extras are installed (fix C4: after API key init)

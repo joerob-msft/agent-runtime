@@ -25,10 +25,17 @@ import asyncio
 import json
 import logging
 import os
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
+
+from agent_runtime.persistent_shell import (
+    PersistentShellManager,
+    normalize_shell_kind,
+    shared_manager as _shared_persistent_shell_manager,
+)
 
 logger = logging.getLogger("devpilot.acp")
 
@@ -65,6 +72,85 @@ class ACPResult:
     stderr: str = ""
     tool_calls: list[dict] = field(default_factory=list)
     error: str = ""
+
+
+@dataclass
+class _PersistentTerminalJob:
+    """Logical ACP terminal backed by a shared persistent shell session."""
+
+    manager: PersistentShellManager
+    session_key: str
+    shell: str
+    command: str
+    args: list[str]
+    cwd: str
+    env: dict[str, str]
+    timeout: int
+    _chunks: list[str] = field(default_factory=list)
+    _read_offset: int = 0
+    exit_code: int = -1
+    timed_out: bool = False
+    done: threading.Event = field(default_factory=threading.Event)
+    _lock: threading.Lock = field(default_factory=threading.Lock)
+
+    @staticmethod
+    def _ps_literal(value: str) -> str:
+        return "'" + value.replace("'", "''") + "'"
+
+    def start(self) -> None:
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self) -> None:
+        result = self.manager.run_command(
+            self.session_key,
+            self._build_command(),
+            shell=self.shell,
+            timeout=self.timeout,
+            workdir=self.cwd,
+            env=self.env,
+            on_chunk=self._on_chunk,
+        )
+        with self._lock:
+            if not self.done.is_set() and not self._chunks and (result.stdout or result.stderr):
+                self._chunks.append(result.stdout + result.stderr)
+            if not self.done.is_set():
+                self.exit_code = result.exit_code
+                self.timed_out = result.timed_out
+        self.done.set()
+
+    def _on_chunk(self, chunk: str, _is_stdout: bool) -> None:
+        with self._lock:
+            self._chunks.append(chunk)
+
+    def _build_command(self) -> str:
+        parts = ["&", self._ps_literal(self.command)]
+        for arg in self.args:
+            parts.append(self._ps_literal(str(arg)))
+        return " ".join(parts)
+
+    def read_output(self) -> tuple[str, bool]:
+        with self._lock:
+            text = "".join(self._chunks)
+            output = text[self._read_offset:]
+            self._read_offset = len(text)
+            is_complete = self.done.is_set()
+        return output, is_complete
+
+    def wait_for_exit(self, timeout: float) -> int:
+        if self.done.wait(timeout):
+            with self._lock:
+                return self.exit_code
+        self.kill(timed_out=True)
+        return -1
+
+    def kill(self, *, timed_out: bool = False) -> None:
+        if self.done.is_set():
+            return
+        self.manager.reset_session(self.session_key)
+        with self._lock:
+            self.exit_code = -1
+            self.timed_out = timed_out
+        self.done.set()
 
 
 # ── Permission policies ─────────────────────────────────────────────────────
@@ -238,6 +324,9 @@ async def run_acp_session(
     effort: Optional[str] = None,
     mode: Optional[str] = None,
     env: Optional[dict[str, str]] = None,
+    persistent_session_key: Optional[str] = None,
+    persistent_shell: Optional[str] = None,
+    persistent_shell_manager: Optional[PersistentShellManager] = None,
     permission_policy: Optional[PermissionPolicy] = None,
     on_event: Optional[Callable[[ACPEvent], None]] = None,
 ) -> ACPResult:
@@ -252,6 +341,9 @@ async def run_acp_session(
         model: Set model via session/set_config_option (e.g. "claude-sonnet-4.6")
         effort: Set reasoning effort ("low", "medium", "high")
         mode: Set session mode ("agent", "plan", "autopilot")
+        persistent_session_key: Reuse this persistent shell session for ACP terminal calls
+        persistent_shell: Shell kind for the persistent session ("pwsh" or "powershell")
+        persistent_shell_manager: Optional shared manager override for tests/embedding
         permission_policy: Policy for handling permission requests (default: deny all)
         on_event: Callback fired for each event (for progress streaming)
 
@@ -266,6 +358,7 @@ async def run_acp_session(
     replay_complete = False  # Boundary marker for session/load replay dedupe
     terminals: dict[str, asyncio.subprocess.Process] = {}
     terminal_outputs: dict[str, str] = {}
+    persistent_terminals: dict[str, _PersistentTerminalJob] = {}
     terminal_counter_ref = [0]  # Shared mutable counter across all message loop phases
 
     workdir_resolved = Path(workdir).resolve()
@@ -274,6 +367,15 @@ async def run_acp_session(
         for key, value in env.items():
             if isinstance(key, str) and isinstance(value, str):
                 merged_env[key] = value
+    persistent_manager = (
+        persistent_shell_manager
+        if persistent_shell_manager is not None
+        else (_shared_persistent_shell_manager() if persistent_session_key else None)
+    )
+    persistent_shell_kind = (
+        normalize_shell_kind(persistent_shell) if persistent_session_key else None
+    )
+    terminal_timeout = max(timeout, 300)
 
     def _path_ok(path: str) -> bool:
         """Validate path is under workdir (resolve symlinks/junctions).
@@ -346,6 +448,12 @@ async def run_acp_session(
             path_ok=_path_ok, terminals=terminals,
             terminal_outputs=terminal_outputs,
             merged_env=merged_env,
+            session_env=env or {},
+            persistent_terminals=persistent_terminals,
+            persistent_manager=persistent_manager,
+            persistent_session_key=persistent_session_key,
+            persistent_shell=persistent_shell_kind,
+            terminal_timeout=terminal_timeout,
             terminal_counter_ref=terminal_counter_ref,
             add_event=lambda e: None, timeout=30,
         )
@@ -369,6 +477,12 @@ async def run_acp_session(
                 path_ok=_path_ok, terminals=terminals,
                 terminal_outputs=terminal_outputs,
                 merged_env=merged_env,
+                session_env=env or {},
+                persistent_terminals=persistent_terminals,
+                persistent_manager=persistent_manager,
+                persistent_session_key=persistent_session_key,
+                persistent_shell=persistent_shell_kind,
+                terminal_timeout=terminal_timeout,
                 terminal_counter_ref=terminal_counter_ref,
                 add_event=lambda e: None,  # Don't track replay events
                 timeout=60,
@@ -389,6 +503,12 @@ async def run_acp_session(
                 path_ok=_path_ok, terminals=terminals,
                 terminal_outputs=terminal_outputs,
                 merged_env=merged_env,
+                session_env=env or {},
+                persistent_terminals=persistent_terminals,
+                persistent_manager=persistent_manager,
+                persistent_session_key=persistent_session_key,
+                persistent_shell=persistent_shell_kind,
+                terminal_timeout=terminal_timeout,
                 terminal_counter_ref=terminal_counter_ref,
                 add_event=lambda e: None, timeout=30,
             )
@@ -420,6 +540,12 @@ async def run_acp_session(
                         path_ok=_path_ok, terminals=terminals,
                         terminal_outputs=terminal_outputs,
                         merged_env=merged_env,
+                        session_env=env or {},
+                        persistent_terminals=persistent_terminals,
+                        persistent_manager=persistent_manager,
+                        persistent_session_key=persistent_session_key,
+                        persistent_shell=persistent_shell_kind,
+                        terminal_timeout=terminal_timeout,
                         terminal_counter_ref=terminal_counter_ref,
                         add_event=lambda e: None, timeout=10,
                     )
@@ -445,6 +571,12 @@ async def run_acp_session(
             path_ok=_path_ok, terminals=terminals,
             terminal_outputs=terminal_outputs,
             merged_env=merged_env,
+            session_env=env or {},
+            persistent_terminals=persistent_terminals,
+            persistent_manager=persistent_manager,
+            persistent_session_key=persistent_session_key,
+            persistent_shell=persistent_shell_kind,
+            terminal_timeout=terminal_timeout,
             terminal_counter_ref=terminal_counter_ref,
             add_event=_add_event, timeout=timeout,
         )
@@ -498,6 +630,9 @@ async def run_acp_session(
                     tproc.kill()
                 except Exception:
                     pass
+        for pjob in persistent_terminals.values():
+            if not pjob.done.is_set():
+                await asyncio.to_thread(pjob.kill)
 
         # Kill agent process
         if proc.returncode is None:
@@ -527,6 +662,12 @@ async def _message_loop(
     terminals: dict[str, asyncio.subprocess.Process],
     terminal_outputs: dict[str, str],
     merged_env: dict[str, str],
+    session_env: dict[str, str],
+    persistent_terminals: dict[str, _PersistentTerminalJob],
+    persistent_manager: Optional[PersistentShellManager],
+    persistent_session_key: Optional[str],
+    persistent_shell: Optional[str],
+    terminal_timeout: int,
     terminal_counter_ref: list[int],
     add_event: Callable[[ACPEvent], None],
     timeout: float,
@@ -642,21 +783,42 @@ async def _message_loop(
                 # Validate cwd
                 if cwd and not path_ok(cwd):
                     cwd = workdir
-                tproc = await asyncio.create_subprocess_exec(
-                    command, *args,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.STDOUT,
-                    cwd=cwd,
-                    env=merged_env,
-                )
-                terminals[tid] = tproc
-                terminal_outputs[tid] = ""
+                if persistent_session_key and persistent_shell and persistent_manager:
+                    pjob = _PersistentTerminalJob(
+                        manager=persistent_manager,
+                        session_key=persistent_session_key,
+                        shell=persistent_shell,
+                        command=command,
+                        args=[str(arg) for arg in args],
+                        cwd=cwd,
+                        env=session_env,
+                        timeout=terminal_timeout,
+                    )
+                    persistent_terminals[tid] = pjob
+                    terminal_outputs[tid] = ""
+                    pjob.start()
+                else:
+                    tproc = await asyncio.create_subprocess_exec(
+                        command, *args,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.STDOUT,
+                        cwd=cwd,
+                        env=merged_env,
+                    )
+                    terminals[tid] = tproc
+                    terminal_outputs[tid] = ""
                 await rpc.respond(msg_id, {"terminalId": tid})
             except Exception as e:
                 await rpc.respond_error(msg_id, -1, str(e))
 
         elif method == "terminal/output":
             tid = params.get("terminalId", "")
+            pjob = persistent_terminals.get(tid)
+            if pjob is not None:
+                output, is_complete = pjob.read_output()
+                terminal_outputs[tid] = terminal_outputs.get(tid, "") + output
+                await rpc.respond(msg_id, {"output": output, "isComplete": is_complete})
+                continue
             tproc = terminals.get(tid)
             if tproc and tproc.stdout:
                 try:
@@ -675,6 +837,11 @@ async def _message_loop(
 
         elif method == "terminal/wait_for_exit":
             tid = params.get("terminalId", "")
+            pjob = persistent_terminals.get(tid)
+            if pjob is not None:
+                exit_code = await asyncio.to_thread(pjob.wait_for_exit, terminal_timeout)
+                await rpc.respond(msg_id, {"exitCode": exit_code})
+                continue
             tproc = terminals.get(tid)
             if tproc:
                 try:
@@ -689,6 +856,9 @@ async def _message_loop(
 
         elif method == "terminal/release":
             tid = params.get("terminalId", "")
+            pjob = persistent_terminals.get(tid)
+            if pjob is not None and pjob.done.is_set():
+                persistent_terminals.pop(tid, None)
             tproc = terminals.pop(tid, None)
             terminal_outputs.pop(tid, None)
             if tproc and tproc.returncode is None:
@@ -697,6 +867,11 @@ async def _message_loop(
 
         elif method == "terminal/kill":
             tid = params.get("terminalId", "")
+            pjob = persistent_terminals.get(tid)
+            if pjob is not None:
+                await asyncio.to_thread(pjob.kill)
+                await rpc.respond(msg_id, {})
+                continue
             tproc = terminals.get(tid)
             if tproc and tproc.returncode is None:
                 tproc.kill()
@@ -735,6 +910,9 @@ def run_acp_session_sync(
     effort: Optional[str] = None,
     mode: Optional[str] = None,
     env: Optional[dict[str, str]] = None,
+    persistent_session_key: Optional[str] = None,
+    persistent_shell: Optional[str] = None,
+    persistent_shell_manager: Optional[PersistentShellManager] = None,
     permission_policy: Optional[PermissionPolicy] = None,
     on_event: Optional[Callable[[ACPEvent], None]] = None,
 ) -> ACPResult:
@@ -753,6 +931,9 @@ def run_acp_session_sync(
         effort=effort,
         mode=mode,
         env=env,
+        persistent_session_key=persistent_session_key,
+        persistent_shell=persistent_shell,
+        persistent_shell_manager=persistent_shell_manager,
         permission_policy=permission_policy,
         on_event=on_event,
     ))

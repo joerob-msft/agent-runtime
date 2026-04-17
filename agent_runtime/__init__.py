@@ -1,6 +1,6 @@
 """agent-runtime — remote agent sidecar for AI coding workflows."""
 
-__version__ = "0.2.2"
+__version__ = "0.3.0"
 
 # pip install URL — used by the wrapper for self-updates.
 # Override with --register <dashboard_url> to pull wheels from a private server.
