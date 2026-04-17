@@ -40,6 +40,22 @@ agent-server --wrapper --tunnel --register https://your-dashboard.example.com
 agent-server --wrapper
 ```
 
+## Python client
+
+The package also includes a small stdlib-only HTTP client for callers that want
+to talk to the runtime API directly from Python:
+
+```python
+from agent_runtime.client import RuntimeClient
+
+client = RuntimeClient("https://your-runtime.example.com", api_key="secret")
+job = client.submit("echo hello", workdir=r"C:\repo")
+health = client.health_check()
+```
+
+`RuntimeClient` covers the same async job, ACP, health, persistent-session, and
+update endpoints that DevPilot uses.
+
 ## API reference
 
 ### Authentication
